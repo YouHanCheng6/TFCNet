@@ -15,7 +15,7 @@ from layers.TPECore import TPECore
 from langchain.schema import HumanMessage
 from data_provider.data_factory import data_provider
 import os
-os.environ['DASHSCOPE_API_KEY'] = 'sk-47379b22191f40cebb7b0993c1dac2c6'
+# Set DASHSCOPE_API_KEY in the environment before using Qwen.
 
 
 class Model(nn.Module):
