@@ -10,9 +10,7 @@ from layers.Embed import PatchEmbedding_temp
 from layers.RevIN import RevIN
 from layers.einops_modules import RearrangeModule
 from transformers import AutoModel, AutoModelForCausalLM, AutoConfig, AutoTokenizer
-from langchain_community.chat_models.tongyi import ChatTongyi
 from layers.TPECore import TPECore
-from langchain.schema import HumanMessage
 from data_provider.data_factory import data_provider
 import os
 # Set DASHSCOPE_API_KEY in the environment before using Qwen.
@@ -93,96 +91,49 @@ class Model(nn.Module):
         # Model
         self._set_model()
 
-        # 处理提示前缀：用 freq_enable 控制是否启用
-        self.use_prompt = getattr(args, 'freq_enable', False)
-
+        # Prompt text is prepared offline; model setup never calls a remote LLM.
+        self.use_prompt = bool(getattr(args, "prompt_file", None))
+        self.prompt_embeddings = None
+        self.prompt_len = 0
         if self.use_prompt:
-            try:
-                self._load_prompt_embeddings()
-                print(f"✅ 自动生成的提示前缀已加载")
-            except Exception as e:
-                self.use_prompt = False
-                print(f"❌ 提示生成失败: {e}")
-        else:
-            print("🚫 未使用提示前缀")
-
-       
+            self._load_prompt_embeddings()
 
     def _load_prompt_embeddings(self):
-        """从数据集中读取真实数据，让通义千问分析"""
-        try:
-            from data_provider.data_factory import data_provider
-            from langchain_community.chat_models.tongyi import ChatTongyi
-            from langchain.schema import HumanMessage
-            
-            # 取一个长序列用于分析
-            train_data, _ = data_provider(self.args, flag="train")
-            sample_x = train_data.data_x[:336]  # 取前336个点
-            
-            seq_min = sample_x.min().item()
-            seq_max = sample_x.max().item()
-            seq_mean = sample_x.mean().item()
-            seq_std = sample_x.std().item()
-            seq_len = len(sample_x)
-            num_features = sample_x.shape[1]
-            
-            prompt_text = f"""分析电力变压器时间序列数据（ETTm1）：
-- 粒度：15分钟一个点，一天96个点
-- 时长：{seq_len}个点（{seq_len * 15}分钟）
-- 特征数：{num_features}个（油温OT、负载等）
-- 数值范围：[{seq_min:.2f}, {seq_max:.2f}]
-- 均值：{seq_mean:.2f}，标准差：{seq_std:.2f}
+        """Load an offline summary and initialize trainable prefix embeddings."""
+        import json
 
-请用一句话总结，包含以下信息（不超过40字）：
-1. 周期模式（是否有96步日周期）
-2. 数值特征（范围、波动大小）
-3. 油温趋势
+        path = Path(self.args.prompt_file)
+        if path.suffix.lower() == ".json":
+            record = json.loads(path.read_text(encoding="utf-8"))
+            expected = getattr(self.args, "data_name", None)
+            if expected and record.get("dataset") != expected:
+                raise ValueError("Prompt cache dataset does not match data_name")
+            summary = record["summary"]
+        else:
+            summary = path.read_text(encoding="utf-8")
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("Prompt file must contain a non-empty summary")
 
-示例：「有96步日周期，数值范围-1到3，波动中等，午后油温达峰值」"""
-            
-            print(f"\n{'='*60}")
-            print(f"📝 发送给通义千问的提示:")
-            print(f"{'='*60}")
-            print(prompt_text)
-            print(f"{'='*60}\n")
-            
-            llm = ChatTongyi()
-            response = llm.invoke([HumanMessage(content=prompt_text)])
-            summary = response.content.strip()
-            
-            print(f"\n{'='*60}")
-            print(f"🤖 通义千问生成的总结:")
-            print(f"{'='*60}")
-            print(f"「{summary}」")
-            print(f"{'='*60}\n")
-            
-            # 加载tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(self.args.LLM_path)
-            tokenizer.pad_token = tokenizer.eos_token
-            
-            device = next(self.model.parameters()).device
-            
-            tokens = tokenizer(summary, return_tensors="pt", truncation=True, max_length=20)
-            tokens = tokens.input_ids.to(device)
-            
-            print(f"🔢 生成的token: {tokens[0].tolist()}")
-            print(f"📝 token解码: {tokenizer.decode(tokens[0])}")
-            
-            token_embeds = self.model.get_input_embeddings()(tokens[0])
-            
-            self.prompt_embeddings = nn.Parameter(
-                token_embeds.unsqueeze(0),
-                requires_grad=True
-            )
-            
-            self.prompt_len = len(tokens[0])
-            print(f"✅ 提示前缀已生成，长度: {self.prompt_len}\n")
-            
-        except Exception as e:
-            print(f"❌ 提示生成失败: {e}")
-            self.prompt_embeddings = None
-            self.prompt_len = 0
-    
+        tokenizer = AutoTokenizer.from_pretrained(self.args.LLM_path)
+        token_ids = tokenizer(summary.strip(), return_tensors="pt",
+                              truncation=False).input_ids
+        limit = getattr(self.args, "prompt_length", 0)
+        if limit < 0:
+            raise ValueError("prompt_length must be non-negative")
+        if limit and token_ids.shape[1] > limit:
+            raise ValueError("Summary exceeds prompt_length; no silent truncation")
+        # Reserve room for the actual patch sequence as well as the prefix.
+        context = getattr(self.model.config, "max_position_embeddings", None)
+        if context is None:
+            context = getattr(self.model.config, "n_positions", None)
+        if context and token_ids.shape[1] >= context:
+            raise ValueError("Prompt leaves no room for historical patch tokens")
+        embeddings = self.model.get_input_embeddings()
+        with torch.no_grad():
+            prefix = embeddings(token_ids.to(embeddings.weight.device)).detach().clone()
+        self.prompt_embeddings = nn.Parameter(prefix, requires_grad=True)
+        self.prompt_len = prefix.shape[1]
+
     def _set_input_layer(self):
         if self.args.LLM == "gpt2":
             pos_embed_type = "none"
@@ -435,6 +386,11 @@ class Model(nn.Module):
         prompt = self.prompt_embeddings.expand(batch_size, prompt_len, -1)
         
         # 拼接：提示在前，原始序列在后
+        context = getattr(self.model.config, "max_position_embeddings", None)
+        if context is None:
+            context = getattr(self.model.config, "n_positions", None)
+        if context and x.shape[1] + prompt_len > context:
+            raise ValueError("Prompt plus patch tokens exceed backbone context length")
         enhanced_x = torch.cat([prompt, x], dim=1)
         
         return enhanced_x

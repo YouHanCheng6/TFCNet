@@ -75,7 +75,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The Qwen integration additionally imports `langchain`, `langchain-community`, and uses the DashScope SDK. Compatible versions are not pinned in this release. See [release notes](#release-notes) for the remaining prerequisites before running experiments.
+Offline prompt preparation uses NumPy/Pandas and the DashScope OpenAI-compatible HTTP endpoint through Python’s standard library. Training does not import a Qwen client or require an API key. See [release notes](#release-notes) for the remaining prerequisites before running experiments.
 
 ### Datasets
 
@@ -110,6 +110,41 @@ export DASHSCOPE_API_KEY="your-own-api-key"
 
 Keep credentials out of source files and Git history. The GPT-2 dataset configuration sets `d_model` to **768**, overriding the parser's initial default of 512. The configuration dictionaries select the first six GPT-2 layers.
 
+## Offline dataset prompts
+
+`TFCNet/prepare_prompts.py` computes statistics from an explicitly specified training prefix of a CSV, then asks Qwen to summarize those statistics. Raw observations are not sent to the API. Dataset name, sampling interval and domain are supplied by the caller rather than fixed to ETTm1.
+
+From `TFCNet/`, for the standard full-shot ETTh1 training split used by the current loader:
+
+```bash
+python prepare_prompts.py \
+  --csv dataset/ETT-small/ETTh1.csv \
+  --dataset ETTh1 --train-rows 8640 \
+  --sampling-interval "1 hour" \
+  --domain "Electricity transformer measurements" \
+  --standardize --words 20 40 80 \
+  --output prompt_cache
+```
+
+Choose `--train-rows` to match the actual training split, including reduced-data experiments; do not include validation or test rows. `--columns` can select the modeled variables. `--standardize` fits per-variable normalization using only those rows. Without it, statistics use original values.
+
+The script computes per-variable ranges, mean, standard deviation, linear trend slopes, detrended spectral peak periods, and peak power fractions. Spectral estimates are descriptive and do not prove seasonality. Each length is generated separately in English; exact whitespace-delimited word counts are checked with bounded retries. No summary is shortened to manufacture another length. A failed word-count requirement stops generation for that length rather than silently saving an invalid result.
+
+JSON caches retain the summary, word count, input statistics, generator, instruction, timestamp and input fingerprint. Matching files are reused without API calls; changed preparation settings require a new output folder or explicit `--force`. Caches may contain dataset statistics and should be handled accordingly.
+
+Pass a prepared file to the experiment driver:
+
+```bash
+python main.py --data_name ETTh1 --LLM gpt2 \
+  --prompt_file prompt_cache/ETTh1_40w.json
+```
+
+The model tokenizes the entire cached summary and initializes trainable prefix embeddings. There is no fixed 20-token truncation. `--prompt_length` is now an optional token-count ceiling that raises an error rather than truncating; the default `0` retains the whole summary. Prefix plus patch tokens must fit the backbone context window. Model initialization and forecasting make no Qwen calls. Embedding weights remain part of the model checkpoint; the JSON cache stores the source text and provenance.
+
+Omitting `--prompt_file` disables prompting. `--ablation no_prompt` also disables it independently of frequency enhancement. A UTF-8 text file can be supplied for a handcrafted prompt; users must ensure its dataset and word count are appropriate. Existing source-packaging issues listed below still apply to the training driver.
+
+This implementation update adds the public prompt preparation path; it is not a reproduction log or evidence that the previously reported experiments used this code.
+
 ## Experiment configuration
 
 The following examples describe the driver's configuration interface. Complete the missing source files and dependency setup listed in [release notes](#release-notes) before execution.
@@ -143,8 +178,7 @@ This option applies `fixed_params` and `tunable_params` from the `__main__` bloc
 This release contains the model and experiment driver. The following items still need to be completed for a reproducible installation:
 
 - **Source packaging:** the driver imports `utils.tools` and `utils.timefeatures`, but the `utils/` source directory is absent. It also imports `models.TFCNet`, whereas `TFCNet.py` is currently at the source-directory root. Restore the utilities and align the model import path.
-- **Qwen dependencies:** the additional Qwen packages need a compatible, verified environment configuration.
-- **Prompt preparation:** the current helper generates text during model setup and contains dataset-specific prompt settings. It needs to be synchronized with the revised manuscript's offline, cached dataset-level prompt preparation.
+- **Prompt preparation:** the offline implementation below replaces the earlier setup-time API helper. It has not been run against Qwen or validated in training as part of this update. It does not establish how the previously reported manuscript experiments were executed.
 - **Ablation configurations:** some options retain legacy branches; verify the selected execution path against the intended manuscript experiment.
 
 Benchmark datasets, pretrained TFCNet checkpoints, and complete reproduction logs are not bundled. End-to-end training has not been validated as part of this documentation update.

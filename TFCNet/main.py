@@ -118,13 +118,13 @@ def get_args_from_parser() -> argparse.Namespace:
         "--prompt_file",
         type=str,
         default=None,
-        help="path to prompt file to prepend to input data"
+        help="offline summary JSON or UTF-8 text file; omit to disable prompts"
     )
     parser.add_argument(
         "--prompt_length",
         type=int,
         default=0,
-        help="length of prompt tokens to use (0 means use all)"
+        help="optional prompt token limit (0: unlimited); over-limit inputs raise, never truncate"
     )
 
     # * basic config
